@@ -18,6 +18,7 @@ from io import open
 import torch
 from torch import nn
 import numpy as np
+from ipdb import set_trace
 
 
 class MockingjayConfig(object):
@@ -34,6 +35,9 @@ class MockingjayConfig(object):
         self.attention_probs_dropout_prob = config['mockingjay']['attention_probs_dropout_prob']
         self.initializer_range = config['mockingjay']['initializer_range']
         self.layer_norm_eps = float(config['mockingjay']['layer_norm_eps'])
+        self.loss = config['mockingjay']['loss']
+        self.n_contrast = config['mockingjay']['n_contrast']
+        self.n_contrast_pool = config['mockingjay']['n_contrast_pool']
 
 
 def prune_linear_layer(layer, index, dim=0):
@@ -517,9 +521,28 @@ class MockingjayForMaskedAcousticModel(MockingjayInitModel):
                                       keep_multihead_output=keep_multihead_output)
         self.SpecHead = MockingjaySpecPredictionHead(config, output_dim if output_dim is not None else input_dim)
         self.apply(self.init_Mockingjay_weights)
-        self.loss = nn.L1Loss() 
+        self.config = config
+        if config.loss == 'infoNCE':
+            self.loss = nn.CrossEntropyLoss()
+            self.raw_feature_dim = 160 * config.downsample_rate
+            self.contrastive = torch.randn(config.n_contrast_pool, self.raw_feature_dim)
+        elif config.loss == 'l1':
+            self.loss = nn.L1Loss() 
+        else:
+            raise NotImplementedError
+
+    def get_contrastive(self, n):
+        permute_indices = torch.randperm(len(self.contrastive))[:n]
+        contrastives = self.contrastive[permute_indices, :]
+        return contrastives
+
+    def add_contrastive(self, tensors):
+        n_contrast = len(self.contrastive)
+        permute_indices = torch.randperm(n_contrast)[:len(tensors)]
+        self.contrastive[permute_indices, :] = tensors.detach().cpu()
 
     def forward(self, spec_input, pos_enc, mask_label=None, attention_mask=None, spec_label=None, head_mask=None):
+        device = spec_input.device
         outputs = self.Mockingjay(spec_input, pos_enc, attention_mask,
                             output_all_encoded_layers=False,
                             head_mask=head_mask)
@@ -529,8 +552,40 @@ class MockingjayForMaskedAcousticModel(MockingjayInitModel):
             sequence_output = outputs
         pred_spec, pred_state = self.SpecHead(sequence_output)
 
+        if self.config.loss == 'infoNCE':
+            intervals = []
+            null = torch.zeros(mask_label.size(0), 1).long()
+            indicator = torch.cat([null, mask_label[:, :, 0].detach().cpu().long(), null], dim=1)
+            diff = indicator[:, 1:] - indicator[:, :-1]
+
+            pred_means = []
+            spec_means = []
+            for d, p, s in zip(diff, pred_spec, spec_label):
+                starts = (d == 1).nonzero().view(-1)
+                ends = (d == -1).nonzero().view(-1)
+                for start, end in zip(starts, ends):
+                    pred_means.append(p[start:end, :].mean(dim=0))
+                    spec_means.append(s[start:end, :].mean(dim=0))
+            pred_means = torch.stack(pred_means)
+            spec_means = torch.stack(spec_means)
+
+            n_contrast = self.config.n_contrast
+            contrasts = self.get_contrastive(n_contrast).to(device)
+            contrasts = contrasts.unsqueeze(0).expand(pred_means.size(0), n_contrast, self.raw_feature_dim)
+            mels = torch.cat([spec_means.unsqueeze(1), contrasts], dim=1)
+            logits = torch.bmm(mels, pred_means.unsqueeze(-1)).squeeze()
+            labels = torch.zeros(logits.size(0)).long().to(device)
+
+            self.add_contrastive(spec_means.detach().cpu())
+        elif self.config.loss == 'l1':
+            mask_label = mask_label.bool()
+            logits = pred_spec.masked_select(mask_label)
+            labels = spec_label.masked_select(mask_label)
+        else:
+            raise NotImplementedError
+
         if spec_label is not None and mask_label is not None:
-            masked_spec_loss = self.loss(pred_spec.masked_select(mask_label), spec_label.masked_select(mask_label))
+            masked_spec_loss = self.loss(logits, labels)
             return masked_spec_loss, pred_spec
         elif self.output_attentions:
             return all_attentions, pred_spec
