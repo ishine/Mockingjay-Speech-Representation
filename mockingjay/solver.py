@@ -354,6 +354,7 @@ class Trainer(Solver):
         ''' Training Unsupervised End-to-end Mockingjay Model'''
         self.verbose('Training set total ' + str(len(self.dataloader)) + ' batches.')
 
+        tr_loss = []
         pbar = tqdm(total=self.total_steps)
         while self.global_step <= self.total_steps:
 
@@ -372,9 +373,12 @@ class Trainer(Solver):
                     self.optimizer.backward(loss)
                 else:
                     loss.backward()
+                tr_loss.append(loss.item())
 
                 # Update
                 if (step+1) % self.gradient_accumulation_steps == 0:
+                    loss = torch.tensor(tr_loss).sum().item()
+                    tr_loss = []
                     if self.apex:
                         # modify learning rate with special warm up BERT uses
                         # if conifg.apex is False, BertAdam is used and handles this automatically
@@ -396,9 +400,9 @@ class Trainer(Solver):
                     if self.global_step % self.log_step == 0:
                         # Log
                         self.log.add_scalar('lr', self.optimizer.get_lr()[0], self.global_step)
-                        self.log.add_scalar('loss', loss.item(), self.global_step)
+                        self.log.add_scalar('loss', loss, self.global_step)
                         self.log.add_scalar('gradient norm', grad_norm, self.global_step)
-                        progress.set_description("Loss %.4f" % loss.item())
+                        progress.set_description("Loss %.4f" % loss)
 
                     if self.global_step % self.save_step == 0:
                         self.save_model('mockingjay')
