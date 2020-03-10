@@ -63,7 +63,7 @@ def process_train_MAM_data(spec, config=None):
     mask_proportion = config['mask_proportion'] if config is not None else MASK_PROPORTION
     mask_consecutive_min = config['mask_consecutive_min'] if config is not None else MASK_CONSECUTIVE
     mask_consecutive_max = config['mask_consecutive_max'] if config is not None else MASK_CONSECUTIVE
-    mask_consecutive = int(random.uniform(mask_consecutive_min, mask_consecutive_max))
+    mask_consecutive_default = int(random.uniform(mask_consecutive_min, mask_consecutive_max + 1))
 
     with torch.no_grad():
         if len(spec) == 2: # if self.duo_feature: dataloader will output `source_spec` and `target_spec`
@@ -92,13 +92,16 @@ def process_train_MAM_data(spec, config=None):
         attn_mask = np.ones((batch_size, seq_len)) # (batch_size, seq_len)
 
         for idx in range(len(spec_stacked)):
+            mask_consecutive = min(mask_consecutive_default, spec_len[idx] // 5)
+            valid_index_range = int(spec_len[idx] - mask_consecutive - 1) # compute valid len for consecutive masking
+            proportion = max(int(spec_len[idx] * mask_proportion // mask_consecutive), 1)
+            if proportion >= valid_index_range:
+                print(f'proportion: {proportion}, valid_index_range: {valid_index_range}')
+                proportion = 1
+            chosen_index = torch.randperm(valid_index_range).data.cpu().numpy()[:proportion] # draw `proportion` samples from the range (0, valid_index_range) and without replacement
             
             # determine whether to mask / random / or do nothing to the frame
             dice = torch.rand(1).data.cpu()
-            valid_index_range = int(spec_len[idx] - mask_consecutive - 1) # compute valid len for consecutive masking
-            proportion = max(int(spec_len[idx] * mask_proportion // mask_consecutive), 1)
-            chosen_index = torch.randperm(valid_index_range).data.cpu().numpy()[:proportion] # draw `proportion` samples from the range (0, valid_index_range) and without replacement
-            
             # mask to zero
             if bool(dice < 0.8):
                 for i in range(mask_consecutive):
