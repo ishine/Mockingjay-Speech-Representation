@@ -51,9 +51,10 @@ hop_length = 250
 griffin_lim_iters = 16
 power = 1.5 # Power to raise magnitudes to prior to Griffin-Lim
 """
-For feature == 'fmllr'
+For feature == 'fmllr' or 'mfcc'
 """
 fmllr_dim = 40
+mfcc_dim = 39
 
 
 #############################
@@ -263,4 +264,11 @@ def plot_embedding(spec, path):
     plt.colorbar()
     plt.tight_layout()
     plt.savefig(path, dpi=300, format="png")
+    plt.close()
+
+
+def plot_attention(attn, path):
+    fig = plt.figure(figsize=(5, 5))
+    plt.imshow(attn)
+    plt.savefig(path, format='png')
     plt.close()

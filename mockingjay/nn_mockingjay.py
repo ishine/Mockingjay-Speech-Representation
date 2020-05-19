@@ -10,11 +10,11 @@
 ###############
 # IMPORTATION #
 ###############
-import sys
-sys.path.append('/media/andi611/1TBSSD/Mockingjay-Speech-Representation')
 import torch
+import random
 import numpy as np
 import torch.nn as nn
+from functools import lru_cache
 from distutils.util import strtobool
 from mockingjay.model import MockingjayConfig, MockingjayModel
 
@@ -25,21 +25,33 @@ from mockingjay.model import MockingjayConfig, MockingjayModel
 """
 Use this class to extract features from the Mockingjay model,
 or to finetune the pre-trained Mockingjay with any downstream tasks.
-Also, this class is `pytorch-kaldi` ready.
+Also, this class is `pytorch-kaldi` ready,
+hence we need to use `str` instead of `bool` in the options dict,
+as pytorch-kaldi scripts will pass in str.
 
 Params:
     `options`: a python dictionary containing the following keys:
         ckpt_file: str, a path specifying the pre-trained ckpt file
-        load_pretrain: bool, whether to load pre-trained weights
-        no_grad: bool, whether to have gradient flow over this class
+        load_pretrain: str, ['True', 'False'], whether to load pre-trained weights
+        no_grad: str, ['True', 'False'], whether to have gradient flow over this class
         dropout: float/str, use float to modify dropout value during downstream finetune, or use the str `default` for pre-train default values
+        spec_aug: str, ['True', 'False'], whether to apply SpecAugment on inputs (used for ASR training)
+        spec_aug_prev: str, ['True', 'False'], apply spec augment on input acoustic features if True, else apply on output representations (used for ASR training)
+        weighted_sum: str, ['True', 'False'], whether to use a learnable weighted sum to integrate hidden representations from all layers, if False then use the last
+        select_layer: int, select from all hidden representations, set to -1 to select the last (will only be used when weighted_sum is False)
     `intput_dim`: int, input dimension of model
 
 An example `options` dictionary:
-    ckpt_file = /media/andi611/1TBSSD/Mockingjay-Speech-Representation/result/result_mockingjay/mockingjay_libri_sd1337_MelBase460-K/mockingjay-500000.ckpt
-    load_pretrain = True
-    no_grad = False
-    dropout = default
+options = {
+    'ckpt_file'     : './result/result_mockingjay/libri_sd1337_fmllrBase960-F-N-K-RA/model-1000000.ckpt',
+    'load_pretrain' : 'True',
+    'no_grad'       : 'True',
+    'dropout'       : 'default',
+    'spec_aug'      : 'False',
+    'spec_aug_prev' : 'True',
+    'weighted_sum'  : 'False',
+    'select_layer'  : -1,
+}
 """
 class MOCKINGJAY(nn.Module):
     def __init__(self, options, inp_dim):
@@ -47,8 +59,13 @@ class MOCKINGJAY(nn.Module):
         
         all_states = torch.load(options["ckpt_file"], map_location='cpu')
         self.config = all_states['Settings']['Config']
-        self.no_grad = bool(strtobool(options["no_grad"]))
-
+        self.no_grad = bool(strtobool(options['no_grad']))
+        self.spec_aug = bool(strtobool(options['spec_aug']))
+        self.spec_aug_prev = bool(strtobool(options['spec_aug_prev']))
+        self.weighted_sum = bool(strtobool(options['weighted_sum']))
+        self.select_layer = int(options['select_layer'])
+        if (not self.no_grad) and (not self.spec_aug_prev): raise RuntimeError('Only one of them can be set False!')
+        
         # increase dropout
         if str(options['dropout']) != 'default':
             self.config['mockingjay']['hidden_dropout_prob'] = float(options['dropout'])
@@ -58,10 +75,17 @@ class MOCKINGJAY(nn.Module):
         self.model_config = MockingjayConfig(self.config)
         self.dr = self.model_config.downsample_rate
         self.hidden_size = self.model_config.hidden_size
+        self.num_layers = self.model_config.num_hidden_layers
+        if not (self.select_layer in list(range(-1, self.num_layers))): raise RuntimeError('Out of range int for \'select_layer\'!')
+
+        # use weighted sum from all layers
+        if self.weighted_sum:
+            self.weight = nn.Parameter(torch.ones(self.num_layers) / self.num_layers)
 
         # Build model
         self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
         self.model = MockingjayModel(self.model_config, inp_dim).to(self.device)
+        self.model.eval() if self.no_grad else self.model.train()
         
         # Load from a PyTorch state_dict
         load = bool(strtobool(options["load_pretrain"]))
@@ -69,7 +93,7 @@ class MOCKINGJAY(nn.Module):
             self.load_model(all_states['Mockingjay'])
             print('[Mockingjay] - Number of parameters: ' + str(sum(p.numel() for p in self.model.parameters() if p.requires_grad)))
         
-        self.out_dim = 768 # This attribute is for pytorch-kaldi
+        self.out_dim = self.hidden_size # 768, This attribute is for pytorch-kaldi
 
 
     def load_model(self, state_dict):
@@ -107,14 +131,14 @@ class MOCKINGJAY(nn.Module):
 
             load(self.model)
             if len(missing_keys) > 0:
-                print("Weights of {} not initialized from pretrained model: {}".format(
+                print('Weights of {} not initialized from pretrained model: {}'.format(
                     self.model.__class__.__name__, missing_keys))
             if len(unexpected_keys) > 0:
-                print("Weights from pretrained model not used in {}: {}".format(
+                print('Weights from pretrained model not used in {}: {}'.format(
                     self.model.__class__.__name__, unexpected_keys))
             if len(error_msgs) > 0:
                 raise RuntimeError('Error(s) in loading state_dict for {}:\n\t{}'.format(
-                                    self.model.__class__.__name__, "\n\t".join(error_msgs)))
+                                    self.model.__class__.__name__, '\n\t'.join(error_msgs)))
             print('[Mockingjay] - Pre-trained weights loaded!')
 
         except: print('[Mockingjay] - Pre-trained weights NOT loaded!')
@@ -126,33 +150,10 @@ class MOCKINGJAY(nn.Module):
         if left_over != 0: spec = spec[:, :-left_over, :]
         spec_stacked = spec.view(spec.shape[0], spec.shape[1]//self.dr, spec.shape[2]*self.dr)
         return spec_stacked
+        
 
-
-    def position_encoding(self, seq_len, batch_size=None, padding_idx=None):
-        ''' Sinusoid position encoding table '''
-        def cal_angle(position, hid_idx):
-            return position / np.power(10000, 2 * (hid_idx // 2) / self.hidden_size)
-     
-        def get_posi_angle_vec(position):
-            return [cal_angle(position, hid_j) for hid_j in range(self.hidden_size)]
-
-        sinusoid_table = np.array([get_posi_angle_vec(pos_i) for pos_i in range(seq_len)])
-
-        sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
-        sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
-
-        if padding_idx is not None:
-            sinusoid_table[padding_idx:] = 0. # zero vector for padding dimension
-
-        if batch_size is not None:
-            batch_sinusoid_table = np.repeat(sinusoid_table[np.newaxis,...], batch_size, axis=0)
-            return batch_sinusoid_table # (batch_size, seq_len, hidden_size)
-        else:
-            return sinusoid_table  # (seq_len, hidden_size)
-
-
-    def process_MAM_data(self, spec):
-        """Process testing data for the masked acoustic model"""
+    def process_input_data(self, spec):
+        """Process input data for the model"""
         
         # add arbitary batch axis B if input `spec` has shape of TxD
         if len(spec.shape) == 2:
@@ -162,7 +163,7 @@ class MOCKINGJAY(nn.Module):
             raise ValueError('Input argument `spec` has invalid shape: {}'.format(spec.shape))
 
         # Down sample
-        spec_stacked = self.down_sample_frames(spec) # (batch_size, seq_len, mel_dim * dr)
+        spec_stacked = self.down_sample_frames(spec) # (batch_size, seq_len, feature_dim * dr)
 
         # Record length for each uttr
         spec_len = np.sum(np.sum(spec_stacked.cpu().data.numpy(), axis=-1) != 0, axis=-1)
@@ -171,25 +172,26 @@ class MOCKINGJAY(nn.Module):
         batch_size = spec_stacked.shape[0]
         seq_len = spec_stacked.shape[1]
 
-        pos_enc = self.position_encoding(seq_len, batch_size) # (batch_size, seq_len, hidden_size)
+        pos_enc = position_encoding(seq_len, self.hidden_size) # (seq_len, hidden_size)
         attn_mask = np.ones((batch_size, seq_len)) # (batch_size, seq_len)
 
         # zero vectors for padding dimension
         for idx in range(len(spec_stacked)):
-            pos_enc[idx][spec_len[idx]:] = 0  
             attn_mask[idx][spec_len[idx]:] = 0 
 
-        spec_stacked = spec_stacked.to(device=self.device, dtype=torch.float32)
-        pos_enc = torch.FloatTensor(pos_enc).to(device=self.device, dtype=torch.float32)
-        attn_mask = torch.FloatTensor(attn_mask).to(device=self.device, dtype=torch.float32)
+        if self.spec_aug and self.spec_aug_prev and self.model.training:
+            spec_stacked = spec_augment(spec_stacked, mask_T=70, mask_F=4, num_T=2, num_F=2, p=1.0) # (batch_size, seq_len, feature_dim * dr)
+        spec_stacked = spec_stacked.to(device=self.device, dtype=torch.float32) # (batch_size, seq_len, feature_dim * dr)
+        pos_enc = torch.FloatTensor(pos_enc).to(device=self.device, dtype=torch.float32).expand(spec_stacked.size(0), *pos_enc.size()) # (batch_size, seq_len, hidden_size)
+        attn_mask = torch.FloatTensor(attn_mask).to(device=self.device, dtype=torch.float32) # (batch_size, seq_len)
         return spec_stacked, pos_enc, attn_mask # (x, pos_enc, attention_mask)
 
 
     def tile_representations(self, reps):
         """ 
-            Tile up the mockingjay representations to match the amount of input frames.
-            Input - encoded_layers shape: (batch_size, sequence_length, hidden_size)
-            Output - tiled_encoded_layers shape: (batch_size, sequence_length * downsample_rate, hidden_size)
+        Tile up the mockingjay representations to match the amount of input frames.
+        Input - encoded_layers shape: (batch_size, sequence_length, hidden_size)
+        Output - tiled_encoded_layers shape: (batch_size, sequence_length * downsample_rate, hidden_size)
         """
         if len(reps.shape) != 3:
             raise ValueError('Input argument `reps` has invalid shape: {}'.format(reps.shape))
@@ -214,9 +216,23 @@ class MOCKINGJAY(nn.Module):
 
         # Model forwarding
         x = x.permute(1, 0, 2).contiguous() # (T, B, D) -> (B, T, D)
-        spec_stacked, pos_enc, attn_mask = self.process_MAM_data(x)
-        x = self.model(spec_stacked, pos_enc, attn_mask, output_all_encoded_layers=False) # (B, T, D)
-        
+        spec_stacked, pos_enc, attn_mask = self.process_input_data(x)
+        x = self.model(spec_stacked, pos_enc, attn_mask, output_all_encoded_layers=self.weighted_sum or self.select_layer != -1) # (B, T, D) or # (N, B, T, D)
+
+        # Apply weighted sum
+        if self.weighted_sum:
+            if type(x) is list: x = torch.stack(x)
+            softmax_weight = nn.functional.softmax(self.weight, dim=-1)
+            B, T, D = x.shape[1], x.shape[2], x.shape[3]
+            x = x.reshape(self.num_layers, -1)
+            x = torch.matmul(softmax_weight, x).reshape(B, T, D)
+        # Select a specific layer
+        elif self.select_layer != -1:
+            x = x[self.select_layer]
+
+        if self.spec_aug and not self.spec_aug_prev and self.model.training:
+            x = spec_augment(x, mask_T=70, mask_F=86, num_T=2, num_F=2, p=1.0) # (B, T, D)
+
         # If using a downsampling model, apply tile and padding
         if x.shape[1] != input_len:
             x = self.tile_representations(x)
@@ -242,3 +258,106 @@ class MOCKINGJAY(nn.Module):
             x = self._forward(x)
         return x
 
+
+#######################
+# POSITIONAL ENCODING #
+#######################
+MAX_SEQLEN = 5000
+@lru_cache(maxsize=1)
+def get_sinusoid_table(hidden_size):
+    def _cal_angle(position, hid_idx):
+        return position / np.power(10000, 2 * (hid_idx // 2) / hidden_size)
+    def _get_posi_angle_vec(position):
+        return [_cal_angle(position, hid_j) for hid_j in range(hidden_size)]
+    sinusoid_table = np.array([_get_posi_angle_vec(pos_i) for pos_i in range(MAX_SEQLEN)])
+    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
+    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
+    return torch.FloatTensor(sinusoid_table)
+
+
+def position_encoding(seq_len, hidden_size):
+    """ position encoding table """     
+    table = get_sinusoid_table(hidden_size)[:seq_len]
+    # no extra CPU and GPU memory allocation
+    # after getting the (seq_len, hidden_size) tensor, one should first put
+    # this tensor into GPU then expand it
+    return table  # (seq_len, hidden_size)
+
+
+################
+# SPEC AUGMENT #
+################
+"""
+Process training data for the supervised ASR model by 
+masking to time-steps and channels during training
+which delays overfitting and significantly improves the final accuracy numbers.
+Input:
+    `spec`: input real frames, with shape: (batch_size, seq_len, feature_dim)
+    `mask_T`: the time mask parameter T described in the SpecAugment paper, 
+              we use default values based on the LD Policy
+              (In paper: T=100, we use 70 since we are training on the 100 hr subset only)
+    `mask_F`: the frequency mask parameter F described in the SpecAugment paper, 
+              we use default values based on the LD Policy
+              (In paper: F=27:D=80*3 -> F=4.5:D=40, where D is acoustic dimension)
+    `num_T` : the number of time masks applied (In paper: mT=2)
+    `num_F` : the number of frequency masks applied (In paper: mF=2)
+    `p` : upper bound ratio (In paper: p=1.0)
+Output:
+    `spec`: augmented frames, with shape: (batch_size, seq_len, feature_dim)
+"""
+def spec_augment(spec, mask_T=70, mask_F=4, num_T=2, num_F=2, p=1.0):
+
+    def _start_to_intervals(starts, consecutive):
+        tiled = starts.expand(consecutive, starts.size(0)).T
+        offset = torch.arange(consecutive).expand_as(tiled)
+        intervals = tiled + offset
+        return intervals.view(-1)
+
+    with torch.no_grad():
+        upper_bound = spec.shape[1] * p # upper bound on the time mask so that a time mask cannot be wider than p times the number of time steps
+        
+        for idx in range(spec.shape[0]):
+
+            # time masking
+            if mask_T > 0 and mask_T < upper_bound:
+                for _ in range(num_T):
+                    rand_consecutive = random.randint(0, mask_T)
+                    chosen_start = torch.randperm(spec.shape[1] - rand_consecutive)[:1]
+                    chosen_intervals = _start_to_intervals(chosen_start, rand_consecutive)
+                    spec[idx, chosen_intervals, :] = 0
+
+            # frequency masking
+            if mask_F > 0:
+                for _ in range(num_F):
+                    rand_bandwidth = random.randint(0, mask_F)
+                    chosen_start = torch.randperm(spec.shape[2] - rand_bandwidth)[:1]
+                    chosen_intervals = _start_to_intervals(chosen_start, rand_bandwidth)
+                    spec[idx, :, chosen_intervals] = 0
+
+        return spec
+
+
+#######
+# LIN #
+#######
+"""
+Linear Input Networks (LIN) for domain adaptation
+Params:
+    `options`: a python dictionary containing arguments for pytorch kaldi, give None if not using with pytorch-kaldi:
+    `intput_dim`: int, input dimension of model
+"""
+class LIN(nn.Module):
+    def __init__(self, options, inp_dim):
+        super(LIN, self).__init__()
+
+        self.out_dim = inp_dim # This attribute is for pytorch-kaldi
+        self.linear = nn.Linear(inp_dim, inp_dim)
+        self.linear.weight.data.copy_(torch.eye(inp_dim))
+        
+        self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        self.linear = self.linear.to(self.device)
+        self.linear.train()
+        
+    def forward(self, x):
+        x = self.linear(x)
+        return x

@@ -22,7 +22,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
 from utility.asr import zero_padding,target_padding
 from utility.mam import process_train_MAM_data, process_test_MAM_data
-from ipdb import set_trace
 
 
 ############
@@ -30,7 +29,7 @@ from ipdb import set_trace
 ############
 HALF_BATCHSIZE_TIME = 400
 HALF_BATCHSIZE_LABEL = 150
-SPEAKER_THRESHOLD = 120
+SPEAKER_THRESHOLD = 0
 
 
 ################
@@ -43,7 +42,7 @@ SPEAKER_THRESHOLD = 120
 #     - max_timestep : int, max len for input (set to 0 for no restriction)
 #     - max_label_len: int, max len for output (set to 0 for no restriction)
 #     - bucket_size  : int, batch size for each bucket
-#     - load         : str, types of data to load: ['asr', 'text', 'spec', 'duo', 'phone', 'speaker', 'speaker_large']
+#     - load         : str, types of data to load: ['asr', 'text', 'acoustic', 'duo', 'phone', 'speaker', 'speaker_large']
 class LibriDataset(Dataset):
     def __init__(self, file_path, sets, bucket_size, max_timestep=0, max_label_len=0, drop=False, load='asr'):
         # define default length
@@ -130,14 +129,15 @@ class AsrDataset(LibriDataset):
 # MEL DATASET #
 ###############
 '''
-The LibriSpeech train-clean-360 (Mel Spectrogram) dataset
+The Acoustic dataset that loads different types of handcrafted features of the LibriSpeech corpus.
+Currently supports 'data/libri_mel160_subword5000' and 'data/libri_fmllr_cmvn' for different preprocessing features.
 '''
-class MelDataset(LibriDataset):
+class AcousticDataset(LibriDataset):
     
-    def __init__(self, run_mockingjay, file_path, sets, bucket_size, max_timestep=0, max_label_len=0, drop=False, mock_config=None, load='spec'):
-        super(MelDataset, self).__init__(file_path, sets, bucket_size, max_timestep, max_label_len, drop, load)
+    def __init__(self, run_mockingjay, file_path, sets, bucket_size, max_timestep=0, max_label_len=0, drop=False, mock_config=None, load='acoustic'):
+        super(AcousticDataset, self).__init__(file_path, sets, bucket_size, max_timestep, max_label_len, drop, load)
 
-        assert(self.load == 'spec'), 'This dataset loads mel features.'
+        assert(self.load == 'acoustic'), 'This dataset loads acoustic features.'
         self.run_mockingjay = run_mockingjay
         self.mock_config = mock_config
         X = self.table['file_path'].tolist()
@@ -329,7 +329,7 @@ class CPC_Phone_Dataset(LibriDataset):
         super(CPC_Phone_Dataset, self).__init__(file_path, sets, bucket_size, max_timestep, max_label_len, drop, load)
         HALF_BATCHSIZE_TIME = 1000
 
-        assert(self.load == 'cpc_phone'), 'This dataset loads mel features and phone boundary labels.'
+        assert(self.load == 'cpc_phone'), 'This dataset loads Kaldi extracted features and phone boundary labels (For the data released in the CPC paper).'
         self.run_mockingjay = run_mockingjay
         self.mock_config = mock_config
         self.phone_path = phone_path
@@ -646,11 +646,11 @@ class Mosei_Dataset(Dataset):
 '''
 The LibriSpeech train-clean-100 (speech, speaker) dataset
 '''
-class Mel_Speaker_Dataset(Dataset):
+class Speaker_Dataset(Dataset):
     
     def __init__(self, split, run_mockingjay, file_path, sets, bucket_size, max_timestep=0, max_label_len=0, drop=False, mock_config=None, load='speaker'):
         
-        HALF_BATCHSIZE_TIME = 2000
+        HALF_BATCHSIZE_TIME = 1000
         assert(load == 'speaker'), 'This dataset loads mel features and speaker ID labels.'
         self.run_mockingjay = run_mockingjay
         self.mock_config = mock_config
@@ -668,19 +668,34 @@ class Mel_Speaker_Dataset(Dataset):
         self.class_num = len(self.speaker2idx)
         print('[Dataset] - Possible speaker classes: ', self.class_num)
         
-        train = tables.sample(frac=0.9, random_state=20190929) # random state is a seed value
-        test = tables.drop(train.index)
-        if split == 'train':
-            self.table = train.sort_values(by=['length'], ascending=False)
-        elif split == 'test':
-            self.table = test.sort_values(by=['length'], ascending=False)
+        # if cpc split files exist, use them
+        usage_list = []
+        if split == 'train' and os.path.isfile('data/cpc_phone/train_split.txt'):
+            usage_list = open(os.path.join('data/cpc_phone/', 'train_split.txt')).readlines()
+        elif split == 'test' and os.path.isfile('data/cpc_phone/test_split.txt'):
+            usage_list = open(os.path.join('data/cpc_phone/', 'test_split.txt')).readlines()
+
+        # use CPC split:
+        if len(usage_list) > 0:
+            self.table = tables
+            usage_list = [line.strip('\n') for line in usage_list]
+            print('[Dataset] - Using CPC train/test splits.')
+        # use random 9:1 split
         else:
-            raise NotImplementedError('Invalid `split` argument!')
+            train = tables.sample(frac=0.9, random_state=20190929) # random state is a seed value
+            test = tables.drop(train.index)
+            if split == 'train':
+                self.table = train.sort_values(by=['length'], ascending=False)
+            elif split == 'test':
+                self.table = test.sort_values(by=['length'], ascending=False)
+            else:
+                raise NotImplementedError('Invalid `split` argument!')
+
         X = self.table['file_path'].tolist()
         X_lens = self.table['length'].tolist()
 
         # Crop seqs that are too long
-        if drop and max_timestep > 0 and self.load != 'text':
+        if drop and max_timestep > 0:
             self.table = self.table[self.table.length < max_timestep]
         if drop and max_label_len > 0:
             self.table = self.table[self.table.label.str.count('_')+1 < max_label_len]
@@ -690,24 +705,29 @@ class Mel_Speaker_Dataset(Dataset):
         batch_x, batch_len = [], []
 
         for x, x_len in zip(X, X_lens):
-            speaker = self.get_speaker_from_path(x)
-            if speaker in self.speaker2idx:
-                batch_x.append(x)
-                batch_len.append(x_len)
-                
-                # Fill in batch_x until batch is full
-                if len(batch_x) == bucket_size:
-                    # Half the batch size if seq too long
-                    if (bucket_size >= 2) and (max(batch_len) > HALF_BATCHSIZE_TIME):
-                        self.X.append(batch_x[:bucket_size//2])
-                        self.X.append(batch_x[bucket_size//2:])
-                    else:
-                        self.X.append(batch_x)
-                    batch_x, batch_len = [], []
+            if len(usage_list) == 0 or self.parse_x_name(x) in usage_list: # check if x is in list if list not empty
+                speaker = self.get_speaker_from_path(x)
+                if speaker in self.speaker2idx:
+                    batch_x.append(x)
+                    batch_len.append(x_len)
+                    
+                    # Fill in batch_x until batch is full
+                    if len(batch_x) == bucket_size:
+                        # Half the batch size if seq too long
+                        if (bucket_size >= 2) and (max(batch_len) > HALF_BATCHSIZE_TIME):
+                            self.X.append(batch_x[:bucket_size//2])
+                            self.X.append(batch_x[bucket_size//2:])
+                        else:
+                            self.X.append(batch_x)
+                        batch_x, batch_len = [], []
         
         # Gather the last batch
         if len(batch_x) > 0:
-            self.X.append(batch_x)
+            if len(usage_list) == 0 or self.parse_x_name(x) in usage_list: # check if x is in list if list not empty
+                self.X.append(batch_x)
+
+    def parse_x_name(self, x):
+        return x.split('/')[-1].split('.')[0]
 
     def __len__(self):
         return len(self.X)
@@ -826,8 +846,8 @@ def get_Dataloader(split, load, data_path, batch_size, max_timestep, max_label_l
     if load in ['asr', 'text']:
         ds = AsrDataset(file_path=data_path, sets=sets, max_timestep=max_timestep, load=load,
                         max_label_len=max_label_len, bucket_size=bs, drop=drop_too_long)
-    elif load == 'spec':
-        ds = MelDataset(run_mockingjay=run_mockingjay, file_path=data_path, sets=sets, max_timestep=max_timestep, load=load, 
+    elif load == 'acoustic':
+        ds = AcousticDataset(run_mockingjay=run_mockingjay, file_path=data_path, sets=sets, max_timestep=max_timestep, load=load, 
                         max_label_len=max_label_len, bucket_size=bs, drop=drop_too_long, mock_config=mock_config)
     elif load == 'duo':
         assert(target_path is not None), '`target path` must be provided for this dataset.'
@@ -858,10 +878,9 @@ def get_Dataloader(split, load, data_path, batch_size, max_timestep, max_label_l
             raise NotImplementedError('Not supported dataset for sentiment')
     elif load == 'speaker':
         sets = train_set[0].replace('360', '100') # Use the `train-clean-100` set instead of the `train-clean-360`
-        ds = Mel_Speaker_Dataset(split=split, run_mockingjay=run_mockingjay, file_path=data_path, sets=sets, max_timestep=max_timestep, load=load,
-                                 max_label_len=max_label_len, bucket_size=64, drop=drop_too_long, mock_config=mock_config)
+        ds = Speaker_Dataset(split=split, run_mockingjay=run_mockingjay, file_path=data_path, sets=sets, max_timestep=max_timestep, load=load,
+                             max_label_len=max_label_len, bucket_size=bs, drop=drop_too_long, mock_config=mock_config)
     else:
         raise NotImplementedError('Invalid `load` argument for `get_Dataloader()`!')
 
     return DataLoader(ds, batch_size=1, shuffle=shuffle, drop_last=False, num_workers=n_jobs, pin_memory=use_gpu)
-

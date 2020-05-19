@@ -1,10 +1,12 @@
 import time
 import inspect
+from collections import defaultdict
+import torch
 
 
 class Timer():
     def __init__(self):
-        self.timings = []
+        self.timings = {}
         self.start_time = 0
 
     def start(self):
@@ -16,11 +18,18 @@ class Timer():
         filename = frameinfo.filename
         filename = '/'.join(filename.split('/')[-2:])
         marker = f'{filename}:{frameinfo.lineno}'
-        self.timings.append( (marker, time.time() - self.start_time) )
+        if marker not in self.timings.keys():
+            self.timings[marker] = []
+        else:
+            self.timings[marker].append( float(time.time() - self.start_time) )
 
     def report(self):
-        print('[TIMER]:')
-        for items in self.timings:
-            for item in items:
-                print(item, end="\t")
-            print()
+        n_points = len(self.timings.keys())
+        if n_points > 0:
+            print('[TIMER]:')
+            for marker in self.timings:
+                print(f'{marker}: {torch.FloatTensor(self.timings[marker]).mean().item()}')
+        else:
+            print('[TIMER]: No record')
+
+timer = Timer()

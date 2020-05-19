@@ -135,3 +135,11 @@ Raw
 CMU_MOSI.zip
 libri_alignment.zip
 data
+
+# checkpoints
+*.ckpt
+*.pth
+
+# experiment files
+*.png
+*.pkl

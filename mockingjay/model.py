@@ -149,16 +149,19 @@ class MockingjaySelfAttention(nn.Module):
         mixed_query_layer = self.query(hidden_states)
         mixed_key_layer = self.key(hidden_states)
         mixed_value_layer = self.value(hidden_states)
+        # each mixed layer: (batch_size, seqlen, head_num * head_dim)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
+        # each layer: (batch_size, head_num, seqlen, head_dim)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         # Apply the attention mask is (precomputed for all layers in MockingjayModel forward() function)
         attention_scores = attention_scores + attention_mask
+        # attention_scores: (batch_size, head_num, seqlen, seqlen)
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
@@ -172,6 +175,7 @@ class MockingjaySelfAttention(nn.Module):
             attention_probs = attention_probs * head_mask
 
         context_layer = torch.matmul(attention_probs, value_layer)
+        # context_layer: (batch_size, head_num, seqlen, head_dim)
         if self.keep_multihead_output:
             self.multihead_output = context_layer
             self.multihead_output.retain_grad()
@@ -329,9 +333,10 @@ class MockingjaySpecPredictionHead(nn.Module):
 
 class MockingjayInitModel(nn.Module):
     """ An abstract class to handle weights initialization."""
-    def __init__(self, config, *inputs, **kwargs):
+    def __init__(self, config, output_attentions, *inputs, **kwargs):
         super(MockingjayInitModel, self).__init__()
         self.config = config
+        self.output_attentions = output_attentions
 
     def init_Mockingjay_weights(self, module):
         """ Initialize the weights.
@@ -394,8 +399,7 @@ class MockingjayModel(MockingjayInitModel):
     ```
     """
     def __init__(self, config, input_dim, output_attentions=False, keep_multihead_output=False):
-        super(MockingjayModel, self).__init__(config)
-        self.output_attentions = output_attentions
+        super(MockingjayModel, self).__init__(config, output_attentions)
         self.input_representations = MockingjayInputRepresentations(config, input_dim)
         self.encoder = MockingjayEncoder(config, output_attentions=output_attentions,
                                            keep_multihead_output=keep_multihead_output)
@@ -511,8 +515,7 @@ class MockingjayForMaskedAcousticModel(MockingjayInitModel):
     ```
     """
     def __init__(self, config, input_dim, output_dim, output_attentions=False, keep_multihead_output=False):
-        super(MockingjayForMaskedAcousticModel, self).__init__(config)
-        self.output_attentions = output_attentions
+        super(MockingjayForMaskedAcousticModel, self).__init__(config, output_attentions)
         self.Mockingjay = MockingjayModel(config, input_dim, output_attentions=output_attentions,
                                       keep_multihead_output=keep_multihead_output)
         self.SpecHead = MockingjaySpecPredictionHead(config, output_dim if output_dim is not None else input_dim)
@@ -530,6 +533,7 @@ class MockingjayForMaskedAcousticModel(MockingjayInitModel):
         pred_spec, pred_state = self.SpecHead(sequence_output)
 
         if spec_label is not None and mask_label is not None:
+            assert mask_label.sum() > 0, 'Without any masking, loss might go NaN. Modify your data preprocessing (utility/mam.py)'
             masked_spec_loss = self.loss(pred_spec.masked_select(mask_label), spec_label.masked_select(mask_label))
             return masked_spec_loss, pred_spec
         elif self.output_attentions:

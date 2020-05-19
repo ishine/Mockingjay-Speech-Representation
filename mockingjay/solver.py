@@ -24,8 +24,9 @@ from tensorboardX import SummaryWriter
 from dataloader import get_Dataloader
 from mockingjay.model import MockingjayConfig, MockingjayModel, MockingjayForMaskedAcousticModel
 from mockingjay.optimization import BertAdam, WarmupLinearSchedule
-from utility.audio import plot_spectrogram_to_numpy, plot_spectrogram, plot_embedding
-from utility.audio import mel_dim, num_freq, fmllr_dim, sample_rate, inv_spectrogram
+from utility.audio import plot_spectrogram_to_numpy, plot_spectrogram, plot_embedding, plot_attention
+from utility.audio import fmllr_dim, mfcc_dim, mel_dim, num_freq, sample_rate, inv_spectrogram
+from utility.mam import position_encoding
 
 
 ##########
@@ -55,7 +56,11 @@ class Solver():
         self.load_model_list = config['solver']['load_model_list']
         self.duo_feature = config['solver']['duo_feature']
         self.output_dim = num_freq if self.duo_feature else None # output dim is the same as input dim if not using duo features
-        self.input_dim = mel_dim if 'fmllr' not in config['dataloader']['data_path'] else fmllr_dim
+        if 'input_dim' in config['mockingjay']:
+            self.input_dim = config['mockingjay']['input_dim']
+            self.verbose('Using `input_dim` setting from config.')
+        else:
+            input_dim = fmllr_dim if 'fmllr' in self.config['dataloader']['data_path'] else mfcc_dim if 'mfcc' in self.config['dataloader']['data_path'] else mel_dim
 
 
     def verbose(self, msg, end='\n'):
@@ -78,7 +83,7 @@ class Solver():
             setattr(self, 'dataloader', get_Dataloader(split, load='duo', use_gpu=self.paras.gpu, \
                     mock_config=self.config['mockingjay'], **self.config['dataloader'])) # Currently the duo feature dataloader only supports mockingjay training, no need to specify `run_mockingjay`
         else:
-            setattr(self, 'dataloader', get_Dataloader(split, load='spec', use_gpu=self.paras.gpu, \
+            setattr(self, 'dataloader', get_Dataloader(split, load='acoustic', use_gpu=self.paras.gpu, \
                     run_mockingjay=True if not load_mel_only else False, mock_config=self.config['mockingjay'], \
                     **self.config['dataloader'])) # specify `run_mockingjay` so dataloader will process mockingjay MAM data
 
@@ -90,15 +95,23 @@ class Solver():
         self.model_config = MockingjayConfig(self.config)
         self.dr = self.model_config.downsample_rate
         self.hidden_size = self.model_config.hidden_size
+        self.with_head = with_head
         self.output_attention = output_attention
         
         if not inference or with_head:
             self.model = MockingjayForMaskedAcousticModel(self.model_config, self.input_dim, self.output_dim, self.output_attention).to(self.device)
-            self.verbose('Number of parameters: ' + str(sum(p.numel() for p in self.model.parameters() if p.requires_grad)))
             self.mockingjay = self.model.Mockingjay
+            if self.paras.multi_gpu:
+                self.model = torch.nn.DataParallel(self.model)
+                self.mockingjay = torch.nn.DataParallel(self.mockingjay)
+                self.verbose('Multi-GPU training Enabled: ' + str(torch.cuda.device_count()))
+            self.verbose('Number of parameters: ' + str(sum(p.numel() for p in self.model.parameters() if p.requires_grad)))
 
         if inference and not with_head:
             self.mockingjay = MockingjayModel(self.model_config, self.input_dim, self.output_attention).to(self.device)
+            if self.paras.multi_gpu:
+                self.mockingjay = torch.nn.DataParallel(self.mockingjay)
+                self.verbose('Multi-GPU training Enabled: ' + str(torch.cuda.device_count()))
             self.verbose('Number of parameters: ' + str(sum(p.numel() for p in self.mockingjay.parameters() if p.requires_grad)))
             self.mockingjay.eval()
         elif inference and with_head:
@@ -147,8 +160,8 @@ class Solver():
     def save_model(self, name, model_all=True):
         if model_all:
             all_states = {
-                'SpecHead': self.model.SpecHead.state_dict(),
-                'Mockingjay': self.mockingjay.state_dict(),
+                'SpecHead': self.model.SpecHead.state_dict() if not self.paras.multi_gpu else self.model.module.SpecHead.state_dict(),
+                'Mockingjay': self.mockingjay.state_dict() if not self.paras.multi_gpu else self.mockingjay.module.state_dict(),
                 'Optimizer': self.optimizer.state_dict(),
                 'Global_step': self.global_step,
                 'Settings': {
@@ -158,7 +171,7 @@ class Solver():
             }
         else:
             all_states = {
-                'Mockingjay': self.mockingjay.state_dict(),
+                'Mockingjay': self.mockingjay.state_dict() if not self.paras.multi_gpu else self.mockingjay.module.state_dict(),
                 'Settings': {
                     'Config': self.config,
                     'Paras': self.paras,
@@ -185,9 +198,13 @@ class Solver():
         if 'SpecHead' in self.load_model_list:
             if not inference or with_head:
                 try:
-                    self.model.SpecHead.load_state_dict(all_states['SpecHead'])
+                    if not self.paras.multi_gpu:
+                        self.model.SpecHead.load_state_dict(all_states['SpecHead'])
+                    else:
+                        self.model.module.SpecHead.load_state_dict(all_states['SpecHead'])
                     self.verbose('[SpecHead] - Loaded')
                 except: self.verbose('[SpecHead - X]')
+                
         if 'Mockingjay' in self.load_model_list:
             try:
                 state_dict = all_states['Mockingjay']
@@ -223,7 +240,12 @@ class Solver():
                         if child is not None:
                             load(child, prefix + name + '.')
 
-                load(self.mockingjay)
+                # perform load
+                if not self.paras.multi_gpu:
+                    load(self.mockingjay)
+                else:
+                    load(self.mockingjay.module)
+
                 if len(missing_keys) > 0:
                     self.verbose("Weights of {} not initialized from pretrained model: {}".format(
                         self.mockingjay.__class__.__name__, missing_keys))
@@ -341,8 +363,15 @@ class Trainer(Solver):
             spec_stacked = spec[4].squeeze(0)
 
             spec_masked = spec_masked.to(device=self.device)
-            pos_enc = torch.FloatTensor(pos_enc).to(device=self.device)
-            mask_label = torch.ByteTensor(mask_label).to(device=self.device)
+            if pos_enc.dim() == 3:
+                # pos_enc: (batch_size, seq_len, hidden_size)
+                # GPU memory need (batch_size * seq_len * hidden_size)
+                pos_enc = torch.FloatTensor(pos_enc).to(device=self.device)
+            elif pos_enc.dim() == 2:
+                # pos_enc: (seq_len, hidden_size)
+                # GPU memory only need (seq_len * hidden_size) even after expanded
+                pos_enc = torch.FloatTensor(pos_enc).to(device=self.device).expand(spec_masked.size(0), *pos_enc.size())
+            mask_label = torch.BoolTensor(mask_label).to(device=self.device)
             attn_mask = torch.FloatTensor(attn_mask).to(device=self.device)
             spec_stacked = spec_stacked.to(device=self.device)
 
@@ -358,9 +387,12 @@ class Trainer(Solver):
 
             progress = tqdm(self.dataloader, desc="Iteration")
 
-            for step, batch in enumerate(progress):
+            step = 0
+            for batch_is_valid, *batch in progress:
                 try:
                     if self.global_step > self.total_steps: break
+                    if not batch_is_valid: continue
+                    step += 1
                     
                     spec_masked, pos_enc, mask_label, attn_mask, spec_stacked = self.process_data(batch)
                     loss, pred_spec = self.model(spec_masked, pos_enc, mask_label, attn_mask, spec_stacked)
@@ -368,8 +400,13 @@ class Trainer(Solver):
                     # Accumulate Loss
                     if self.gradient_accumulation_steps > 1:
                         loss = loss / self.gradient_accumulation_steps
-                    if self.apex:
+                    if self.apex and self.paras.multi_gpu:
+                        raise NotImplementedError
+                    elif self.apex:
                         self.optimizer.backward(loss)
+                    elif self.paras.multi_gpu:
+                        loss = loss.sum()
+                        loss.backward()
                     else:
                         loss.backward()
 
@@ -381,9 +418,6 @@ class Trainer(Solver):
                             lr_this_step = self.learning_rate * self.warmup_linear.get_lr(self.global_step, self.warmup_proportion)
                             for param_group in self.optimizer.param_groups:
                                 param_group['lr'] = lr_this_step
-                        
-                        pbar.update(1)
-                        self.global_step += 1
                         
                         # Step
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
@@ -412,14 +446,47 @@ class Trainer(Solver):
                             self.log.add_image('pred_spec', pred_spec, self.global_step)
                             self.log.add_image('true_spec', true_spec, self.global_step)
                 
-                except RuntimeError:
-                    print('CUDA out of memory at step: ', self.global_step)
-                    torch.cuda.empty_cache()
-                    self.optimizer.zero_grad()
+                        pbar.update(1)
+                        self.global_step += 1
+                        
+                except RuntimeError as e:
+                    if 'CUDA out of memory' in str(e):
+                        print('CUDA out of memory at step: ', self.global_step)
+                        torch.cuda.empty_cache()
+                        self.optimizer.zero_grad()
+                    else:
+                        raise
                 
         pbar.close()
+        self.log.close()
         self.reset_train()
         
+
+    def test_reconstruct(self):
+        head_mask = None
+        prune_headids = self.config['mockingjay']['prune_headids']
+        if prune_headids is not None:
+            layer_num = self.config['mockingjay']['num_hidden_layers']
+            head_num = self.config['mockingjay']['num_attention_heads']
+            head_mask = torch.ones(layer_num, head_num)
+            layer_ids = [idx // head_num for idx in prune_headids]
+            head_ids = [idx % head_num for idx in prune_headids]
+            head_mask[layer_ids, head_ids] = 0.0  
+
+        epoch_loss = []
+        for batch_is_valid, *batch in tqdm(self.dataloader):
+            assert batch_is_valid
+
+            spec_masked, pos_enc, mask_label, attn_mask, spec_stacked = self.process_data(batch)
+            if head_mask is not None:
+                head_mask = head_mask.to(spec_masked.device)
+            
+            with torch.no_grad():
+                loss, pred_spec = self.model(spec_masked, pos_enc, mask_label, attn_mask, spec_stacked, head_mask)
+            epoch_loss.append(loss.item())
+
+        print(sum(epoch_loss) / len(epoch_loss))
+
 
 ##########
 # TESTER #
@@ -456,16 +523,15 @@ class Tester(Solver):
         batch_size = spec_stacked.shape[0]
         seq_len = spec_stacked.shape[1]
 
-        pos_enc = self.position_encoding(seq_len, batch_size) # (batch_size, seq_len, hidden_size)
+        pos_enc = position_encoding(seq_len, self.hidden_size) # (seq_len, hidden_size)
         attn_mask = np.ones((batch_size, seq_len)) # (batch_size, seq_len)
 
         # zero vectors for padding dimension
         for idx in range(len(spec_stacked)):
-            pos_enc[idx][spec_len[idx]:] = 0  
             attn_mask[idx][spec_len[idx]:] = 0 
 
         spec_stacked = spec_stacked.to(device=self.device, dtype=torch.float32)
-        pos_enc = torch.FloatTensor(pos_enc).to(device=self.device, dtype=torch.float32)
+        pos_enc = torch.FloatTensor(pos_enc).to(device=self.device, dtype=torch.float32).expand(spec_stacked.size(0), *pos_enc.size())
         attn_mask = torch.FloatTensor(attn_mask).to(device=self.device, dtype=torch.float32)
         return spec_stacked, pos_enc, attn_mask # (x, pos_enc, attention_mask)
 
@@ -478,7 +544,14 @@ class Tester(Solver):
         attn_mask = spec[2].squeeze(0)
     
         spec_stacked = spec_stacked.to(device=self.device)
-        pos_enc = torch.FloatTensor(pos_enc).to(device=self.device)
+        if pos_enc.dim() == 3:
+            # pos_enc: (batch_size, seq_len, hidden_size)
+            # GPU memory need (batch_size * seq_len * hidden_size)
+            pos_enc = torch.FloatTensor(pos_enc).to(device=self.device)
+        elif pos_enc.dim() == 2:
+            # pos_enc: (seq_len, hidden_size)
+            # GPU memory only need (seq_len * hidden_size) even after expanded
+            pos_enc = torch.FloatTensor(pos_enc).to(device=self.device).expand(spec_stacked.size(0), *pos_enc.size())
         attn_mask = torch.FloatTensor(attn_mask).to(device=self.device)
         return spec_stacked, pos_enc, attn_mask # (x, pos_enc, attention_mask)
 
@@ -514,23 +587,15 @@ class Tester(Solver):
                 spec_stacked, pos_enc, attn_mask = self.process_MAM_data(spec=x)
                 
                 if with_head:
-                    outputs = self.model(spec_stacked, pos_enc, attention_mask=attn_mask)
-                    if self.output_attention:
-                        _, pred_spec = outputs
-                    else:
-                        pred_spec, _ = outputs
-
+                    pred_spec, _ = self.model(spec_stacked, pos_enc, attention_mask=attn_mask)
+                    
                     # generate the model filled MAM spectrogram
                     spec_masked = copy.deepcopy(spec_stacked)
                     for i in range(len(spec_masked)):
                         sample_index = random.sample(range(len(spec_masked[i])), int(len(spec_masked[i])*self.config['mockingjay']['mask_proportion']))
                         spec_masked[i][sample_index] = 0
-                    outputs = self.model(spec_masked, pos_enc, attention_mask=attn_mask)
-                    if self.output_attention:
-                        _, fill_spec = outputs
-                    else:
-                        fill_spec, _ = outputs
-
+                    fill_spec, _ = self.model(spec_masked, pos_enc, attention_mask=attn_mask)
+                    
                     # plot reconstructed / ground-truth / MAM filled spectrogram
                     for y_pred, y_true, y_fill in zip(pred_spec, spec_stacked, fill_spec):
                         
@@ -551,17 +616,6 @@ class Tester(Solver):
                         if idx >= 10:
                             self.verbose('Spectrogram head generated samples are saved to: {}'.format(self.dump_dir))
                             exit() # visualize the first 10 testing samples
-                elif self.output_attention:
-                    all_attentions, _ = self.mockingjay(spec_stacked, pos_enc, attention_mask=attn_mask, output_all_encoded_layers=True)
-                    all_attentions = torch.stack(all_attentions).transpose(0, 1)
-                    # all_attentions: (batch_size, num_layer, num_head, Q_seq_len, K_seq_len)
-
-                    for attentions in all_attentions:
-                        torch.save(attentions.cpu(), os.path.join(self.dump_dir, f'{idx}_attentions'))
-                        idx += 1
-                        if idx >= 10:
-                            self.verbose(f'Attention samples are saved to {self.dump_dir}')
-                            exit()
                 else:
                     encoded_layers = self.mockingjay(spec_stacked, pos_enc, attention_mask=attn_mask, output_all_encoded_layers=True)
                     encoded_layers = torch.stack(encoded_layers)
@@ -594,6 +648,27 @@ class Tester(Solver):
                         break # visualize the first 10 testing samples
 
 
+    def plot_attention(self):
+        attn_dir = os.path.join('attentions', self.exp_name)
+        if not os.path.exists(attn_dir): os.makedirs(attn_dir)
+        with torch.no_grad():
+            sample_index = torch.arange(0, self.dataloader.dataset.__len__(), self.dataloader.dataset.__len__() // 5)
+            for i, idx in enumerate(tqdm(sample_index)):
+                x = self.dataloader.dataset[idx]
+                spec_stacked, pos_enc, attn_mask = self.process_MAM_data(spec=x)
+                
+                all_attentions, _ = self.mockingjay(spec_stacked, pos_enc, attention_mask=attn_mask, output_all_encoded_layers=True)
+                all_attentions = torch.stack(all_attentions).transpose(0, 1)
+                # all_attentions: (batch_size, num_layer, num_head, Q_seq_len, K_seq_len)
+
+                sample_dir = os.path.join(attn_dir, str(i))
+                if not os.path.exists(sample_dir): os.makedirs(sample_dir)
+                for layerid, layer_attentions in enumerate(all_attentions[0]):
+                    for headid, head_attention in enumerate(layer_attentions):
+                        plot_attention(head_attention.detach().cpu(), os.path.join(sample_dir, f'{layerid}-{headid}.png'))
+                    plot_attention(layer_attentions.mean(dim=0).detach().cpu(), os.path.join(sample_dir, f'{layerid}-average.png'))
+
+
     def forward(self, spec, all_layers=True, tile=True, process_from_loader=False):
         """ 
             Generation of the Mockingjay Model Representation
@@ -613,7 +688,18 @@ class Tester(Solver):
                 spec_stacked, pos_enc, attn_mask = self.process_MAM_data(spec=spec)
             else:
                 spec_stacked, pos_enc, attn_mask = self.process_data(spec=spec) # Use dataloader to process MAM data to increase speed
-            reps = self.mockingjay(spec_stacked, pos_enc, attention_mask=attn_mask, output_all_encoded_layers=all_layers)
+
+            head_mask = None
+            prune_headids = self.config['mockingjay']['prune_headids']
+            if prune_headids is not None:
+                layer_num = self.config['mockingjay']['num_hidden_layers']
+                head_num = self.config['mockingjay']['num_attention_heads']
+                head_mask = torch.ones(layer_num, head_num).to(spec_stacked.device)
+                layer_ids = [idx // head_num for idx in prune_headids]
+                head_ids = [idx % head_num for idx in prune_headids]
+                head_mask[layer_ids, head_ids] = 0.0  
+            
+            reps = self.mockingjay(spec_stacked, pos_enc, attention_mask=attn_mask, output_all_encoded_layers=all_layers, head_mask=head_mask)
 
             if type(reps) is list:
                 reps = torch.stack(reps)
