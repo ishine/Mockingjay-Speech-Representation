@@ -19,7 +19,7 @@ from torch.nn.utils.rnn import pack_padded_sequence
 # LINEAR CLASSIFIER #
 #####################
 class LinearClassifier(nn.Module):
-    def __init__(self, input_dim, class_num, task, dconfig):
+    def __init__(self, input_dim, class_num, dconfig):
         super(LinearClassifier, self).__init__()
         
         output_dim = class_num
@@ -104,7 +104,7 @@ class LinearClassifier(nn.Module):
 
 
     def forward(self, features, labels=None, label_mask=None):
-        # features from mockingjay: (batch_size, layer, seq_len, feature_dim)
+        # features from transformer: (batch_size, layer, seq_len, feature_dim)
         # features from baseline: (batch_size, seq_len, feature_dim)
         # labels: (batch_size, seq_len), frame by frame classification
         batch_size = features.size(0)
@@ -117,7 +117,7 @@ class LinearClassifier(nn.Module):
             labels = labels.unsqueeze(-1).expand(batch_size, seq_len)
 
         if len(features.shape) == 4:
-            # compute mean on mockingjay representations if given features from mockingjay
+            # compute mean on transformer representations if given features from transformer
             if self.select_hidden == 'last':
                 features = features[:, -1, :, :]
             elif self.select_hidden == 'first':
@@ -136,7 +136,7 @@ class LinearClassifier(nn.Module):
                 features = features[:, self.select_hidden, :, :]
 
         # since the down-sampling (float length be truncated to int) and then up-sampling process
-        # can cause a mismatch between the seq lenth of mockingjay representation and that of label
+        # can cause a mismatch between the seq lenth of transformer representation and that of label
         # we truncate the final few timestamp of label to make two seq equal in length
         truncated_length = min(features.size(1), labels.size(-1))
         features = features[:, :truncated_length, :]
@@ -184,8 +184,11 @@ class LinearClassifier(nn.Module):
         return prob
 
 
+##################
+# RNN CLASSIFIER #
+##################
 class RnnClassifier(nn.Module):
-    def __init__(self, input_dim, class_num, task, dconfig):
+    def __init__(self, input_dim, class_num, dconfig):
         # The class_num for regression mode should be 1
 
         super(RnnClassifier, self).__init__()
@@ -239,7 +242,7 @@ class RnnClassifier(nn.Module):
 
     def forward(self, features, labels=None, valid_lengths=None):
         assert(valid_lengths is not None), 'Valid_lengths is required.'
-        # features from mockingjay: (batch_size, layer, seq_len, feature)
+        # features from transformer: (batch_size, layer, seq_len, feature)
         # features from baseline: (batch_size, seq_len, feature)
         # labels: (batch_size,), one utterance to one label
         # valid_lengths: (batch_size, )
@@ -250,7 +253,7 @@ class RnnClassifier(nn.Module):
 
         select_hidden = self.config['select_hidden']
         if len(features.shape) == 4:
-            # compute mean on mockingjay representations if given features from mockingjay
+            # compute mean on transformer representations if given features from transformer
             if select_hidden == 'last':
                 features = features[:, -1, :, :]
             elif select_hidden == 'first':
@@ -317,6 +320,21 @@ class RnnClassifier(nn.Module):
         return result
 
 
+##################
+# DUMMY UPSTREAM #
+##################
+class dummy_upstream(nn.Module):
+    def __init__(self, input_dim):
+        super(dummy_upstream, self).__init__()
+        self.out_dim = input_dim
+
+    def forward(self, features):
+        return features
+
+
+######################
+# EXAMPLE CLASSIFIER #
+######################
 class example_classifier(nn.Module):
     def __init__(self, input_dim, hidden_dim, class_num):
         super(example_classifier, self).__init__()
