@@ -1,10 +1,17 @@
 # -*- coding: utf-8 -*- #
 """*********************************************************************************************"""
-#   FileName     [ runner.py ]
+#   FileName     [ src/runner.py ]
 #   Synopsis     [ scripts for running pre-training and downstream evaluation of transformer models ]
 #   Author       [ Andy T. Liu (Andi611) ]
 #   Copyright    [ Copyleft(c), Speech Lab, NTU, Taiwan ]
 """*********************************************************************************************"""
+
+
+"""
+WARNING:
+    This script is deprecated,
+    we suggest you use the new scripts of: `run_upstream.py` and `run_downstream.py`
+"""
 
 
 ###############
@@ -26,19 +33,19 @@ def get_runner_args():
     parser = argparse.ArgumentParser(description='Argument Parser for the S3PLR project.')
     
     # setting
-    parser.add_argument('--config', type=str, help='Path to experiment config.', required=True)
+    parser.add_argument('--config', default='../config/deprecated_runner/tera_libri_fmllrBase_pretrain,yaml', type=str, help='Path to experiment config.', required=False)
     parser.add_argument('--seed', default=1337, type=int, help='Random seed for reproducable results.', required=False)
 
     # Logging
-    parser.add_argument('--logdir', default='log/log_transformer/', type=str, help='Logging path.', required=False)
+    parser.add_argument('--logdir', default='../log/log_transformer/', type=str, help='Logging path.', required=False)
     parser.add_argument('--name', default=None, type=str, help='Name for logging.', required=False)
 
     # model ckpt
     parser.add_argument('--load', action='store_true', help='Load pre-trained model to restore training, no need to specify this during testing.')
-    parser.add_argument('--ckpdir', default='result/result_transformer/', type=str, help='path to store experiment result.', required=False)
+    parser.add_argument('--ckpdir', default='../result/result_transformer/', type=str, help='path to store experiment result.', required=False)
     parser.add_argument('--ckpt', default='fmllrBase960-F-N-K-libri/states-1000000.ckpt', type=str, help='path to transformer model checkpoint.', required=False)
     parser.add_argument('--dckpt', default='baseline_sentiment_libri_sd1337/baseline_sentiment-500000.ckpt', type=str, help='path to downstream checkpoint.', required=False)
-    parser.add_argument('--apc_path', default='./result/result_apc/apc_libri_sd1337_standard/apc-500000.ckpt', type=str, help='path to the apc model checkpoint.', required=False)
+    parser.add_argument('--apc_path', default='../result/result_apc/apc_libri_sd1337_standard/apc-500000.ckpt', type=str, help='path to the apc model checkpoint.', required=False)
 
     # mockingjay
     parser.add_argument('--train', action='store_true', help='Train the model.')

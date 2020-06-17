@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*- #
 """*********************************************************************************************"""
-#   FileName     [ rnn/runner_apc.py ]
+#   FileName     [ rnn/runner.py ]
 #   Synopsis     [ run train / test for the apc model ]
 #   Author       [ Andy T. Liu (Andi611) ]
 #   Copyright    [ Copyleft(c), Speech Lab, NTU, Taiwan ]
@@ -52,7 +52,7 @@ class get_apc_config():
         self.rnn_residual = True # Apply residual connections between RNN layers if specified
 
         # Training configuration
-        self.optimizer = "adam" # The gradient descent optimizer (e.g., sgd, adam, etc.)
+        self.optimizer = 'adam' # The gradient descent optimizer (e.g., sgd, adam, etc.)
         self.batch_size = 32 # Training minibatch size
         self.learning_rate = 0.001 # Initial learning rate
         self.total_steps = 500000 # Number of training steps
@@ -66,7 +66,7 @@ class get_apc_config():
         self.feature_dim = 80 # The dimension of the input frame
         self.load_data_workers = 8 # Number of parallel data loaders
         self.experiment_name = 'apc_libri_sd' + str(seed) # Name of this experiment
-        self.log_path = './log/log_apc/' # Where to save the logs
+        self.log_path = './result/result_apc/' # Where to save the logs
         self.result_path = './result/result_apc/' # Where to save the trained models
 
         # Data path configurations
@@ -79,7 +79,7 @@ class get_apc_config():
 ##################
 # GET APC SOLVER #
 ##################
-def get_apc_solver(seed, train=True):
+def Runner(seed, train=True):
     solver = Solver(get_apc_config(seed))
     solver.load_data(split='train' if train else 'test')
     solver.set_model(inference=False if train else True)
@@ -112,14 +112,14 @@ def main():
 
     # Train apc
     if args.train:
-        solver = get_apc_solver(args.seed, train=True)
+        solver = Runner(args.seed, train=True)
         solver.train()
 
     ##################################################################################
 
     # Test apc
     elif args.test:
-        solver = get_apc_solver(args.seed, train=False)
+        solver = Runner(args.seed, train=False)
         solver.test()
 
 

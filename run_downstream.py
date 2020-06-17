@@ -34,27 +34,36 @@ USAGE:
 """
 
 
+#################
+# PATH HANDLING #
+#################
+import sys
+S3PRL_PATH = os.getcwd() # or set this to your own path that points to the S3PRL repo
+if S3PRL_PATH not in sys.path:
+    sys.path.append(S3PRL_PATH)
+
+
 ########################
 # DOWNSTREAM ARGUMENTS #
 ########################
 def get_downstream_args():
     
-    parser = argparse.ArgumentParser(description='Argument Parser for the S3PLR project.')
+    parser = argparse.ArgumentParser(description='Argument Parser for Downstream Tasks of the S3PLR project.')
     
     # required
     parser.add_argument('--run',  choices=['phone_linear', 'phone_1hidden', 'phone_concat', 'speaker_frame', 'speaker_utterance'], help='select task.', required=True)
 
     # upstream settings
-    parser.add_argument('--ckpt', default='', type=str, help='path to upstream pre-trained checkpoint, required if using other than baseline', required=False)
-    parser.add_argument('--upstream', choices=['transformer', 'apc', 'baseline'], default='baseline', help='whether to use upstream models for speech representation or fine-tune.', required=False)
-    parser.add_argument('--input_dim', default=80, type=str, help='input dimension used to initialize transformer models', required=False)
-    parser.add_argument('--fine_tune', action='store_true', help='whether to fine tune the transformer model with downstream task.', required=False)
-    parser.add_argument('--weighted_sum', action='store_true', help='whether to use weighted sum on the transformer model with downstream task.', required=False)
+    parser.add_argument('--ckpt', default='', type=str, help='Path to upstream pre-trained checkpoint, required if using other than baseline', required=False)
+    parser.add_argument('--upstream', choices=['transformer', 'apc', 'baseline'], default='baseline', help='Whether to use upstream models for speech representation or fine-tune.', required=False)
+    parser.add_argument('--input_dim', default=80, type=str, help='Input dimension used to initialize transformer models', required=False)
+    parser.add_argument('--fine_tune', action='store_true', help='Whether to fine tune the transformer model with downstream task.', required=False)
+    parser.add_argument('--weighted_sum', action='store_true', help='Whether to use weighted sum on the transformer model with downstream task.', required=False)
     
     # Options
     parser.add_argument('--name', default=None, type=str, help='Name of current experiment.', required=False)
     parser.add_argument('--config', default='config/downstream.yaml', type=str, help='Path to downstream experiment config.', required=False)
-    parser.add_argument('--expdir', default='', type=str, help='path to store experiment result, if empty then default is used', required=False)
+    parser.add_argument('--expdir', default='', type=str, help='Path to store experiment result, if empty then default is used.', required=False)
     parser.add_argument('--seed', default=1337, type=int, help='Random seed for reproducable results.', required=False)
     parser.add_argument('--cpu', action='store_true', help='Disable GPU training.')
 
@@ -71,7 +80,9 @@ def get_downstream_args():
 # GET DATALOADER #
 ##################
 def get_dataloader(args, dataloader_config):
-    
+
+    if not os.path.exists(dataloader_config['data_path']):
+        raise RuntimeError('[run_downstream] - Data path not valid:', dataloader_config['data_path'])    
     print('[run_downstream] - Loading input data: ' + str(dataloader_config['train_set']) + ' from ' + dataloader_config['data_path'])
     if args.task == 'speaker':
         print('[run_downstream] - Loading speaker data: ' + str(dataloader_config['train_set']) + ' from ' + dataloader_config['data_path'])
@@ -79,13 +90,13 @@ def get_dataloader(args, dataloader_config):
         print('[run_downstream] - Loading phone data: ' + dataloader_config['phone_path'])
 
     print('[run_downstream] - getting train dataloader...')
-    train_loader = get_Dataloader(split='train', load=args.task, use_gpu=args.gpu, **dataloader_config)
+    train_loader = get_Dataloader(split='train', load=args.task, use_gpu=args.gpu, seed=args.seed, **dataloader_config)
 
     print('[run_downstream] - getting dev dataloader...')
-    dev_loader = get_Dataloader(split='dev', load=args.task, use_gpu=args.gpu, **dataloader_config)
+    dev_loader = get_Dataloader(split='dev', load=args.task, use_gpu=args.gpu, seed=args.seed, **dataloader_config)
 
     print('[run_downstream] - getting test dataloader...')
-    test_loader = get_Dataloader(split='test', load=args.task, use_gpu=args.gpu, **dataloader_config)
+    test_loader = get_Dataloader(split='test', load=args.task, use_gpu=args.gpu, seed=args.seed, **dataloader_config)
     
     return train_loader, dev_loader, test_loader
 
@@ -181,13 +192,13 @@ def main():
     # get downstream model
     downstream_model = get_downstream_model(args, upstream_model.out_dim, train_loader.dataset.class_num, config)
 
+    # train
     runner = Runner(args=args,
                     runner_config=config['runner'],
                     dataloader= {'train':train_loader, 'dev':dev_loader, 'test':test_loader}, 
                     upstream=upstream_model, 
                     downstream=downstream_model, 
                     expdir=expdir)
-    
     runner.set_model()
     runner.train()
 

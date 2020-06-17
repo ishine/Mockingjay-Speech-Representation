@@ -24,10 +24,11 @@ from downstream.solver import get_optimizer
 # RUNNER #
 ##########
 class Runner():
-    ''' Handler for complete training and evaluation progress'''
+    ''' Handler for complete training and evaluation progress of downstream models '''
     def __init__(self, args, runner_config, dataloader, upstream, downstream, expdir):
 
         self.device = torch.device('cuda') if (args.gpu and torch.cuda.is_available()) else torch.device('cpu')
+        if torch.cuda.is_available(): print('[Runner] - CUDA is available!')
         self.model_kept = []
         self.global_step = 1
         self.log = SummaryWriter(expdir)
@@ -57,7 +58,7 @@ class Runner():
         self.downstream_model.train()
 
 
-    def save_model(self, name='states'):
+    def save_model(self, name='states', save_best=None):
         
         all_states = {
             'Upstream': self.upstream_model.state_dict() if self.args.fine_tune else None,
@@ -70,7 +71,12 @@ class Runner():
             },
         }
 
-        model_path = '{}/{}-{}.ckpt'.format(self.expdir, name, self.global_step)
+        if save_best is not None:
+            model_path = f'{self.expdir}/{save_best}.ckpt'
+            torch.save(all_states, model_path)
+            return
+
+        model_path = f'{self.expdir}/{name}-{self.global_step}.ckpt'
         torch.save(all_states, model_path)
         self.model_kept.append(model_path)
 
@@ -99,7 +105,11 @@ class Runner():
                     # features: (1, batch_size, seq_len, feature)
                     # dimension of labels depend on task and dataset, but the first dimention is always trivial due to bucketing, eg. (1, ...)
                     features = features.squeeze(0).to(device=self.device, dtype=torch.float32)
-                    features = self.upstream_model(features)
+                    if self.args.fine_tune:
+                        features = self.upstream_model(features)
+                    else:
+                        with torch.no_grad():
+                            features = self.upstream_model(features)
 
                     # Since zero padding technique, some timestamps of features are not valid
                     # For each timestamps, we mark 1 on valid timestamps, and 0 otherwise
@@ -167,7 +177,7 @@ class Runner():
                         self.log.add_scalar(f"{self.config['evaluation']}_acc", eval_acc, self.global_step)
                         if eval_acc > best_eval_acc:
                             print('[Runner] - Saving new best model on: ', self.config['evaluation'])
-                            self.save_model(name=f"best_{self.config['evaluation']}")
+                            self.save_model(save_best=f"best_{self.config['evaluation']}")
                             torch.cuda.empty_cache()
                             best_eval_acc = eval_acc
                         
@@ -179,7 +189,7 @@ class Runner():
                             self.log.add_scalar('test_acc', test_acc, self.global_step)
                             if test_acc > best_test_acc:
                                 print('[Runner] - Saving new best model on: ', 'test')
-                                self.save_model(name='best_test')
+                                self.save_model(save_best='best_test')
                                 torch.cuda.empty_cache()
                                 best_test_acc = test_acc
 
